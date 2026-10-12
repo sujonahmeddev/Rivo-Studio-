@@ -1,0 +1,196 @@
+name: Android APK
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  debug-apk:
+    name: Test and build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python 3.13 for Chaquopy
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.0'
+
+      - name: Set up Gradle and restore dependency cache
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+          cache-cleanup: on-success
+
+      - name: Test the bundled Python execution bridge
+        id: python-tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/ci-logs
+          python --version
+          python -m unittest discover -s app/src/test/python -v 2>&1 | tee build/ci-logs/python-tests.log
+
+      - name: Validate Gradle project configuration
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/ci-logs
+          ./gradlew --no-daemon --console=plain --stacktrace help 2>&1 | tee build/ci-logs/configuration.log
+
+      - name: Run unit tests, lint, and build debug APK
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/ci-logs
+          rm -rf app/build/outputs/apk/debug
+          ./gradlew --no-daemon --console=plain --stacktrace \
+            :app:testDebugUnitTest \
+            :app:lintDebug \
+            :app:assembleDebug \
+            2>&1 | tee build/ci-logs/build-and-test.log
+
+      - name: Collect APK and build metadata
+        id: collect
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_dir='app/build/outputs/apk/debug'
+          if [[ ! -d "$output_dir" ]]; then
+            echo "Expected debug APK output directory was not created: $output_dir" >&2
+            exit 1
+          fi
+          mapfile -t apks < <(find "$output_dir" -type f -name '*.apk' -print | sort)
+          if (( ${#apks[@]} == 0 )); then
+            echo "No debug APK was generated under $output_dir" >&2
+            exit 1
+          fi
+          mkdir -p artifacts
+          for apk in "${apks[@]}"; do
+            cp "$apk" "artifacts/$(basename "$apk")"
+          done
+          {
+            printf 'Application: Rivo Studio\n'
+            printf 'Variant: debug (not a signed production release)\n'
+            printf 'Commit: %s\n' "$GITHUB_SHA"
+            printf 'Ref: %s\n' "$GITHUB_REF"
+            printf 'Workflow run: %s\n' "$GITHUB_RUN_ID"
+            printf 'JDK: 17 (Temurin)\n'
+            printf 'Gradle wrapper: %s\n' "$(grep '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties | sed 's/.*gradle-//; s/-bin.zip.*//')"
+            printf 'Android compile SDK: 35\n'
+            printf 'Python build interpreter: 3.13 (Chaquopy)\n'
+            printf '\nAPK files and SHA-256:\n'
+            find artifacts -maxdepth 1 -type f -name '*.apk' -print0 | sort -z | xargs -0 sha256sum
+          } > artifacts/BUILD-INFO.txt
+
+      - name: Upload debug APK artifact
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RivoStudio-debug-APK
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Collect failure diagnostics
+        if: failure()
+        env:
+          PYTHON_TEST_OUTCOME: ${{ steps.python-tests.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validate.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        shell: bash
+        run: |
+          mkdir -p build/ci-logs
+          {
+            echo 'Rivo Studio Android CI failure report'
+            echo "Commit: $GITHUB_SHA"
+            echo "Ref: $GITHUB_REF"
+            echo "Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Python runner tests: $PYTHON_TEST_OUTCOME"
+            echo "Configuration validation step: $VALIDATION_OUTCOME"
+            echo "Android build/test step: $BUILD_OUTCOME"
+            echo
+            echo 'This run does not modify source code or push commits. Inspect the first Gradle error below, correct the source/configuration, then push a new commit. No automatic repair retry is performed, so this workflow cannot form a self-triggering commit loop.'
+            echo
+            for log in build/ci-logs/*.log; do
+              [[ -f "$log" ]] || continue
+              echo "===== $log: Gradle failure section ====="
+              if ! sed -n '/\* What went wrong:/,/\* Try:/p' "$log" | tail -n 160; then
+                echo 'No standard Gradle failure section was found in this log.'
+              fi
+              echo
+              echo "===== $log: matching error lines ====="
+              grep -E -i '(^e: |error:|failed|exception|could not|cannot |unresolved reference|no matching variant|lint found|tests? failed|what went wrong)' "$log" | tail -n 100 || true
+              echo
+            done
+          } > failure-diagnostics.txt
+          cat failure-diagnostics.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RivoStudio-build-diagnostics
+          path: |
+            failure-diagnostics.txt
+            build/ci-logs/*.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish build summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        shell: bash
+        run: |
+          {
+            echo '## Rivo Studio Android APK build'
+            echo
+            echo "- **Result:** $JOB_STATUS"
+            echo "- **Commit:** \`$GITHUB_SHA\`"
+            echo "- **Branch/ref:** \`$GITHUB_REF\`"
+            echo "- **Run:** [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+            echo '- **Checks:** Python bridge unit tests, Gradle configuration validation, Android unit tests, Android lint, and `:app:assembleDebug`.'
+            if [[ "$JOB_STATUS" == 'success' ]]; then
+              echo '- **APK:** Download `RivoStudio-debug-APK` from this run’s Artifacts section. It contains the debug APK and `BUILD-INFO.txt`.'
+              echo '- **Release signing:** Not required for this debug APK. A signed release is built only by the separate manual release workflow when signing secrets are configured.'
+            else
+              echo '- **APK:** No debug APK artifact is published for a failed or cancelled run.'
+              echo '- **Diagnostics:** See the `RivoStudio-build-diagnostics` artifact and the failing step logs above.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,28 @@
+# Gradle / Android build outputs
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+*.ap_
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local logs and generated diagnostics
+*.log
+failure-diagnostics.txt
+
+# Signing material and local secret files (never commit these)
+*.jks
+*.keystore
+*.p12
+*.pfx
+release-key.properties
+secrets.properties

@@ -1,0 +1,239 @@
+name: Signed release APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-apk:
+    name: Build and verify signed release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check signing configuration
+        id: signing
+        env:
+          RIVO_RELEASE_KEYSTORE_BASE64: ${{ secrets.RIVO_RELEASE_KEYSTORE_BASE64 }}
+          RIVO_RELEASE_STORE_PASSWORD: ${{ secrets.RIVO_RELEASE_STORE_PASSWORD }}
+          RIVO_RELEASE_KEY_ALIAS: ${{ secrets.RIVO_RELEASE_KEY_ALIAS }}
+          RIVO_RELEASE_KEY_PASSWORD: ${{ secrets.RIVO_RELEASE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "$RIVO_RELEASE_KEYSTORE_BASE64" ]] || missing+=(RIVO_RELEASE_KEYSTORE_BASE64)
+          [[ -n "$RIVO_RELEASE_STORE_PASSWORD" ]] || missing+=(RIVO_RELEASE_STORE_PASSWORD)
+          [[ -n "$RIVO_RELEASE_KEY_ALIAS" ]] || missing+=(RIVO_RELEASE_KEY_ALIAS)
+          [[ -n "$RIVO_RELEASE_KEY_PASSWORD" ]] || missing+=(RIVO_RELEASE_KEY_PASSWORD)
+          if (( ${#missing[@]} > 0 )); then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            {
+              echo '## Signed release APK not built'
+              echo
+              echo 'The debug APK workflow does not need release credentials and remains available. To build a signed release, configure all four repository or environment secrets listed in `docs/CI_AND_RELEASES.md`, then run **Signed release APK** again.'
+              echo
+              printf 'Missing secret names: `%s`\n' "${missing[*]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          keystore="$RUNNER_TEMP/rivo-release.jks"
+          if ! printf '%s' "$RIVO_RELEASE_KEYSTORE_BASE64" | base64 --decode > "$keystore"; then
+            echo 'The release keystore secret is not valid base64.' >&2
+            exit 1
+          fi
+          if [[ ! -s "$keystore" ]]; then
+            echo 'The decoded release keystore is empty.' >&2
+            exit 1
+          fi
+          chmod 600 "$keystore"
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        if: steps.signing.outputs.ready == 'true'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python 3.13 for Chaquopy
+        if: steps.signing.outputs.ready == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up Android SDK
+        if: steps.signing.outputs.ready == 'true'
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+
+      - name: Install Android SDK packages
+        if: steps.signing.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.0'
+
+      - name: Set up Gradle and restore dependency cache
+        if: steps.signing.outputs.ready == 'true'
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+        with:
+          cache-cleanup: on-success
+
+      - name: Validate Gradle project configuration
+        id: validate
+        if: steps.signing.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/ci-logs
+          ./gradlew --no-daemon --console=plain --stacktrace help 2>&1 | tee build/ci-logs/configuration.log
+
+      - name: Run release tests, lint, and assemble signed APK
+        id: build
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          RIVO_RELEASE_STORE_FILE: ${{ runner.temp }}/rivo-release.jks
+          RIVO_RELEASE_STORE_PASSWORD: ${{ secrets.RIVO_RELEASE_STORE_PASSWORD }}
+          RIVO_RELEASE_KEY_ALIAS: ${{ secrets.RIVO_RELEASE_KEY_ALIAS }}
+          RIVO_RELEASE_KEY_PASSWORD: ${{ secrets.RIVO_RELEASE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/ci-logs
+          rm -rf app/build/outputs/apk/release
+          ./gradlew --no-daemon --console=plain --stacktrace \
+            :app:testReleaseUnitTest \
+            :app:lintRelease \
+            :app:assembleRelease \
+            2>&1 | tee build/ci-logs/release-build-and-test.log
+
+      - name: Verify release signature and collect APK
+        id: collect
+        if: success() && steps.signing.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_dir='app/build/outputs/apk/release'
+          if [[ ! -d "$output_dir" ]]; then
+            echo "Expected release APK output directory was not created: $output_dir" >&2
+            exit 1
+          fi
+          mapfile -t apks < <(find "$output_dir" -type f -name '*.apk' -print | sort)
+          if (( ${#apks[@]} == 0 )); then
+            echo "No release APK was generated under $output_dir" >&2
+            exit 1
+          fi
+          apksigner="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          [[ -x "$apksigner" ]] || { echo "Android apksigner was not found: $apksigner" >&2; exit 1; }
+          mkdir -p artifacts
+          for apk in "${apks[@]}"; do
+            "$apksigner" verify --verbose --print-certs "$apk"
+            cp "$apk" "artifacts/$(basename "$apk")"
+          done
+          {
+            printf 'Application: Rivo Studio\n'
+            printf 'Variant: release (signature verified with apksigner)\n'
+            printf 'Commit: %s\n' "$GITHUB_SHA"
+            printf 'Ref: %s\n' "$GITHUB_REF"
+            printf 'Workflow run: %s\n' "$GITHUB_RUN_ID"
+            printf 'JDK: 17 (Temurin)\n'
+            printf 'Android compile SDK: 35\n'
+            printf 'Python build interpreter: 3.13 (Chaquopy)\n'
+            printf '\nAPK files and SHA-256:\n'
+            find artifacts -maxdepth 1 -type f -name '*.apk' -print0 | sort -z | xargs -0 sha256sum
+          } > artifacts/BUILD-INFO.txt
+
+      - name: Upload signed release artifact
+        if: success() && steps.signing.outputs.ready == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RivoStudio-signed-release-APK
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Collect release failure diagnostics
+        if: failure()
+        env:
+          SIGNING_OUTCOME: ${{ steps.signing.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validate.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        shell: bash
+        run: |
+          mkdir -p build/ci-logs
+          {
+            echo 'Rivo Studio signed release build failure report'
+            echo "Commit: $GITHUB_SHA"
+            echo "Ref: $GITHUB_REF"
+            echo "Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Signing setup step: $SIGNING_OUTCOME (secret values are never printed)"
+            echo "Configuration validation step: $VALIDATION_OUTCOME"
+            echo "Release build/test step: $BUILD_OUTCOME"
+            echo
+            echo 'No source changes are generated or pushed automatically. Review the first actual Gradle/signing error below; the signed release workflow does not retry or self-commit.'
+            echo
+            for log in build/ci-logs/*.log; do
+              [[ -f "$log" ]] || continue
+              echo "===== $log: Gradle failure section ====="
+              sed -n '/\* What went wrong:/,/\* Try:/p' "$log" | tail -n 160
+              echo
+              echo "===== $log: matching error lines ====="
+              grep -E -i '(^e: |error:|failed|exception|could not|cannot |unresolved reference|no matching variant|lint found|tests? failed|what went wrong)' "$log" | tail -n 100 || true
+              echo
+            done
+          } > failure-diagnostics.txt
+          cat failure-diagnostics.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: RivoStudio-release-diagnostics
+          path: |
+            failure-diagnostics.txt
+            build/ci-logs/*.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove temporary signing keystore
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/rivo-release.jks"
+
+      - name: Publish release build summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          SIGNING_READY: ${{ steps.signing.outputs.ready }}
+        shell: bash
+        run: |
+          {
+            echo '## Rivo Studio signed release build'
+            echo
+            echo "- **Result:** $JOB_STATUS"
+            echo "- **Commit:** \`$GITHUB_SHA\`"
+            echo "- **Ref:** \`$GITHUB_REF\`"
+            echo "- **Run:** [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+            if [[ "$JOB_STATUS" != 'success' ]]; then
+              echo '- **Release APK:** No release artifact is published after a failed or cancelled signing/build/verification step.'
+              echo '- **Diagnostics:** See the `RivoStudio-release-diagnostics` artifact and the failing step logs.'
+            elif [[ "$SIGNING_READY" != 'true' ]]; then
+              echo '- **Release APK:** Not built because release-signing secrets are not configured. This is an intentional skip, not an unsigned release.'
+              echo '- **Debug APK:** Build and download it from the separate `Android APK` workflow; no signing secrets are needed.'
+              echo '- **Setup:** Follow `docs/CI_AND_RELEASES.md` to configure the four release secrets.'
+            else
+              echo '- **Release APK:** Download `RivoStudio-signed-release-APK` from this run’s Artifacts section. `apksigner` verified the signature before upload.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
