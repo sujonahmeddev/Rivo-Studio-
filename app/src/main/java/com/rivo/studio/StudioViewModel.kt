@@ -728,7 +728,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     val last = turns.last()
                     turns[turns.lastIndex] = ChatTurn(
                         last.role,
-                        last.content + "\n\nSelected file context (secret-like values were redacted):\nFile: ${context.first}\n```\n${context.second}\n```,
+                        last.content + "\n\nSelected file context (secret-like values were redacted):\nFile: ${context.first}\n```\n${context.second}\n```",
                     )
                 }
                 val answer = ai.chat(
