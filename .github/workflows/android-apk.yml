@@ -160,14 +160,14 @@ jobs:
             done
           } > failure-diagnostics.txt
           cat failure-diagnostics.txt >> "$GITHUB_STEP_SUMMARY"
-          diagnostic_line=$(grep -ihE '(^e: |error:|Unresolved reference|Could not resolve|Could not find|No matching variant|Lint found|There were failing tests|tests? failed|Execution failed)' build/ci-logs/*.log 2>/dev/null | head -n 1 || true)
-          if [[ -n "$diagnostic_line" ]]; then
+          mapfile -t diagnostic_lines < <(grep -ihE '(^e: |error:|Unresolved reference|Could not resolve|Could not find|No matching variant|Lint found|There were failing tests|tests? failed|Execution failed)' build/ci-logs/*.log 2>/dev/null | head -n 25 || true)
+          for diagnostic_line in "${diagnostic_lines[@]}"; do
             diagnostic_line="${diagnostic_line:0:500}"
             annotation=${diagnostic_line//'%'/'%25'}
             annotation=${annotation//$'\r'/'%0D'}
             annotation=${annotation//$'\n'/'%0A'}
-            echo "::error title=First build diagnostic::${annotation}"
-          fi
+            echo "::error title=Build diagnostic::${annotation}"
+          done
 
       - name: Upload failure diagnostics
         if: failure()

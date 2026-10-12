@@ -12,7 +12,7 @@ The debug APK is a test build using the Android debug signing key. It is not a p
 
 ## Failure reports, retries, and safe permissions
 
-A failing build, test, lint, SDK setup, or APK collection step leaves the Actions run failed. The workflow summary shows the commit, ref, result, failed step context, and how to find diagnostics. When Gradle emits a recognized compiler, dependency, lint, or test error, the first matching line is also exposed as a check annotation. Gradle output is retained in the run logs and bundled with the extracted failure report in the **RivoStudio-build-diagnostics** artifact for 14 days.
+A failing build, test, lint, SDK setup, or APK collection step leaves the Actions run failed. The workflow summary shows the commit, ref, result, failed step context, and how to find diagnostics. When Gradle emits recognized compiler, dependency, lint, or test errors, up to 25 matching lines are also exposed as check annotations. Gradle output is retained in the run logs and bundled with the extracted failure report in the **RivoStudio-build-diagnostics** artifact for 14 days.
 
 The pipeline does **not** change project files, change dependency versions, commit, or push in response to a failure. Automatic source repair is intentionally disabled: this repository has no configured code-repair service or narrowly scoped write credential, and allowing generated edits to self-commit would be unsafe. There is no automatic retry loop. Inspect the real error, make a reviewed correction, and push it; the next run performs a clean, bounded build. Debug builds cancel superseded runs on the same ref; release runs are serialized without cancellation. Workflows have read-only repository permissions and third-party Actions are pinned to commit SHAs.
 
