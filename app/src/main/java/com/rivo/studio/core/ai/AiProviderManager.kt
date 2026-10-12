@@ -214,7 +214,7 @@ private object HttpTransport {
             connection.instanceFollowRedirects = false
             connection.setRequestProperty("Accept", "application/json")
             connection.setRequestProperty("User-Agent", "RivoStudio/0.1")
-            headers.forEach(connection::setRequestProperty)
+            headers.forEach { (name, value) -> connection.setRequestProperty(name, value) }
             if (body != null) {
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
