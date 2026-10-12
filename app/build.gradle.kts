@@ -136,10 +136,10 @@ kapt {
 }
 
 dependencies {
-    // Compose 1.7.6 retains the TextFieldValue BasicTextField API used for
-    // editor selection, syntax highlighting, and non-wrapping code input.
-    // A future BOM upgrade should migrate CodeEditor to TextFieldState first.
-    val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
+    // The editor currently uses TextFieldValue, VisualTransformation, and
+    // non-wrapping BasicTextField input. Keep Compose 1.6.8 until a deliberate
+    // migration of CodeEditor to the state-based TextFieldState API.
+    val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
     implementation(composeBom)
     androidTestImplementation(composeBom)
 
